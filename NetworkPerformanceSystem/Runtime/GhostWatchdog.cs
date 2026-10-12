@@ -112,37 +112,56 @@ namespace NetworkPerformanceSystem.Runtime {
             float deadline = ConnectionTimeout.DeadlineFor(server.m_rpc);
             if (deadline <= 0f) { return; }
 
+            // Longer than usual only while the host has said its game is in the background
+            // (ConnectionTimeout, Keep Players In The Background).
+            bool hostAway = deadline > ConnectionTimeout.UsualDeadlineFor(server.m_rpc);
+
             float silence = PeerLiveness.SilenceSeconds(server.m_uid);
             bool transportDead = PeerLiveness.LinkStateOf(server.m_uid) == RttProbe.LinkState.Dead;
 
             if (transportDead || silence >= deadline) {
-                Trip(transportDead, silence);
+                Trip(transportDead, silence, hostAway);
                 return;
             }
 
-            if (silence >= deadline * WarnFraction) {
-                Warn(deadline - silence);
+            if (silence >= WarnAfterSeconds(server.m_rpc)) {
+                Warn(deadline - silence, hostAway);
                 return;
             }
 
             Recover(silent: false);
         }
 
-        private static void Warn(float secondsLeft) {
+        /// <summary>
+        /// How long the server may be silent before the player is told: half the deadline. While
+        /// the host's game is in the background, half the deadline it would otherwise have - the
+        /// player is told why the world has stopped as soon as they would have been told it was
+        /// lost, rather than minutes into a wait they can cut short by leaving.
+        /// </summary>
+        internal static float WarnAfterSeconds(ZRpc serverRpc) {
+            return ConnectionTimeout.UsualDeadlineFor(serverRpc) * WarnFraction;
+        }
+
+        private static void Warn(float secondsLeft, bool hostAway) {
             if (_warning && Time.realtimeSinceStartup - _lastWarnAt < WarnRepeatSeconds) { return; }
 
             if (!_warning) {
                 _warning = true;
                 TotalWarnings++;
-                Logger.LogWarning($"The server has stopped answering. Leaving in {secondsLeft:F0}s unless it comes back.");
+                Logger.LogWarning(hostAway
+                    ? $"The server has stopped answering, and the host's game is in the background. Waiting up to {secondsLeft:F0}s more for it."
+                    : $"The server has stopped answering. Leaving in {secondsLeft:F0}s unless it comes back.");
             }
             _lastWarnAt = Time.realtimeSinceStartup;
 
             // showDespiteHiddenHUD: a player who has hidden the HUD for a screenshot still needs
             // to know the session is about to end.
             if (MessageHud.instance != null) {
+                float left = Mathf.Max(0f, secondsLeft);
                 MessageHud.instance.ShowMessage(MessageHud.MessageType.Center,
-                    $"Lost contact with the server - reconnecting ({Mathf.Max(0f, secondsLeft):F0}s)",
+                    hostAway
+                        ? $"The host's game is in the background - waiting for it ({left:F0}s)"
+                        : $"Lost contact with the server - reconnecting ({left:F0}s)",
                     0, null, showDespiteHiddenHUD: true, log: false);
             }
         }
@@ -159,7 +178,7 @@ namespace NetworkPerformanceSystem.Runtime {
             }
         }
 
-        private static void Trip(bool transportDead, float silence) {
+        private static void Trip(bool transportDead, float silence, bool hostAway) {
             _tripped = true;
             _warning = false;
             TotalTrips++;
@@ -167,12 +186,16 @@ namespace NetworkPerformanceSystem.Runtime {
             string why = transportDead
                 ? "the connection is dead as far as the transport is concerned"
                 : $"nothing has arrived for {silence:F0}s";
+            if (hostAway) { why += " while the host's game was in the background"; }
             Logger.LogWarning($"Leaving the session: {why}. Anything done since the server went quiet was "
                               + "never received by it.");
 
-            PendingReason = "Lost connection to the server.\n\nYou were returned to the menu rather than left "
-                            + "playing a world the server is no longer part of. Progress made after contact was "
-                            + "lost did not reach it.";
+            PendingReason = hostAway && !transportDead
+                ? "Lost connection to the server.\n\nThe host's game went into the background and did not come "
+                  + "back in time. Progress made after contact was lost did not reach it."
+                : "Lost connection to the server.\n\nYou were returned to the menu rather than left "
+                  + "playing a world the server is no longer part of. Progress made after contact was "
+                  + "lost did not reach it.";
 
             if (MessageHud.instance != null) {
                 MessageHud.instance.ShowMessage(MessageHud.MessageType.Center,

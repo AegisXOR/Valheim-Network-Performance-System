@@ -19,7 +19,7 @@ namespace NetworkPerformanceSystem.Runtime {
         SyncListCache,  // M9     - ZDOMan.CreateSyncList per-peer sector scan reuse
         PlayerLimit,    // M10    - ZNet.RPC_PeerInfo configurable player cap
         ConnectionTimeout, // M11 - ZRpc.SetLongTimeout + Steam TimeoutInitial/TimeoutConnected
-        RpcOwnerRouting,   // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of owner-addressed RPCs (station item requests, creature hits) to the current owner
+        RpcOwnerRouting,   // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of owner-addressed RPCs (station item requests, creature and structure hits, terrain edits) to the current owner
         JotunnQueueLimit,  // M13 - Jotunn.Entities.CustomRPC.MaximumSendQueueSize kept above the M2 window ceiling
         QueueSizeView,     // M14 - ZSteamSocket.GetSendQueueSize shown to other mods as vanilla's window would leave it
         DeserializeAlloc,  // M15 - ZDO.Deserialize field read without the fourteen per-ZDO delegates
@@ -45,6 +45,8 @@ namespace NetworkPerformanceSystem.Runtime {
         CreatureAllowance,      // M35 - the arbiter (host): a player whose frame rate drops, or whose upload stays full, under a fight is given fewer creatures, and the rest move to players with room
         DamageNumbers,          // M36 - DamageText.ShowText / ZRoutedRpc.HandleRoutedRPC + M7's relay: damage numbers go to everyone nearby, only the attacker, or nobody
         AutoSendRate,           // M37 - M1's ping postfix + ZNet.Update (host): the send rate, and each player's upload grant, found from load and congestion between the game's 150 KB/s and a maximum
+        MapPins,                // M38 - Minimap.UpdatePlayerPins (client): other players' map icons jump to a far new spot instead of sliding there at 200 m/s, and follow players loaded nearby (every player, on the host) live
+        MapPositions,           // M39 - ZNet.Update + ZNet.SendPlayerList (host) / ZNet.SendServerSyncPlayerData (client): a player's map position goes out as soon as everyone's copy is more than a few metres off, and a player's own jump is reported at once
     }
 
     /// <summary>

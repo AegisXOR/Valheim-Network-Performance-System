@@ -128,6 +128,22 @@ namespace NetworkPerformanceSystem.Runtime {
     /// Presence is judged by the station test - the 3x3 square the ownership pass uses for "owner
     /// present" on anything that is not a creature - so a claim made here is one the pass keeps.
     /// No item rides on any of these, so nothing is refunded.
+    ///
+    /// TERRAIN EDITS are the fourth family: TerrainComp's RPC_ApplyOperation - every dig, raise,
+    /// level, cultivate and pave - and GradualTerrain's smoothing around a dig. TerrainOp.Awake
+    /// sends the operation to every terrain tile it touches, addressed through the digger's copy of
+    /// that tile's owner, and RPC_ApplyOperation drops it on a non-owner; GradualTerrain addresses
+    /// and gates its smoothing the same way. A lost edit costs more than the edit itself. A vertex on
+    /// the border between two tiles is stored in both, so a dig that lands on one tile and is
+    /// dropped on its neighbour leaves the two copies apart, and the ground splits open along the
+    /// border. Presence is judged by the station test - a terrain compiler is an ordinary object to
+    /// the ownership pass - and a tile with no present owner is handed to the sender, who has it
+    /// loaded or could not have dug or smoothed it. A tile with nobody credible to take it is left
+    /// to vanilla, as a structure hit is. Order within a tile matters - smoothing should follow the
+    /// dig it smooths - and holding keeps it: while a tile's new owner has not yet been sent its
+    /// ownership, every later request for that tile waits too, and FlushHeld forwards them in the
+    /// order they came (short of the owner changing again meanwhile). Both handlers are gated on
+    /// IsOwner, so double delivery is impossible here for the same reason as for stations.
     /// </summary>
     internal static class RpcOwnerRouter {
 
@@ -137,6 +153,7 @@ namespace NetworkPerformanceSystem.Runtime {
             Station,
             Creature,
             Structure,
+            Terrain,
         }
 
         /// <summary>What one family of requests needed correcting. "Re-targeted" and "claimed" are
@@ -168,6 +185,7 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static readonly Counters Stations = new Counters();
         internal static readonly Counters Creatures = new Counters();
         internal static readonly Counters Structures = new Counters();
+        internal static readonly Counters TerrainEdits = new Counters();
 
         /// <summary>The owner-addressed creature requests that must land. Only RPC_Damage - see the
         /// class comment for why RPC_Stagger is not one of them.</summary>
@@ -186,6 +204,17 @@ namespace NetworkPerformanceSystem.Runtime {
             "RPC_SetSnow".GetStableHashCode(),             // WearNTear
             "RPC_ClearCachedSupport".GetStableHashCode(),  // WearNTear, addressed by the sender's copy of a neighbour's owner
         };
+
+        /// <summary>The owner-addressed requests on a terrain tile's compiler. GradualTerrain's name
+        /// is matched as a string, so it must stay equal to the one that mod registers on
+        /// TerrainComp; a mismatch only means its smoothing is left to vanilla again.</summary>
+        private static readonly HashSet<int> TerrainRequestHashes = new HashSet<int> {
+            "RPC_ApplyOperation".GetStableHashCode(),                // TerrainComp - every dig, raise, level, cultivate and pave
+            "GradualTerrain_RPC_SmoothTerrain".GetStableHashCode(),  // GradualTerrain - the smoothing around a dig
+        };
+
+        /// <summary>Per-prefab verdict: does it carry a TerrainComp.</summary>
+        private static readonly Dictionary<int, bool> TerrainPrefabs = new Dictionary<int, bool>();
 
         /// <summary>
         /// The owner-addressed requests the station components make. Anything they send to
@@ -268,6 +297,7 @@ namespace NetworkPerformanceSystem.Runtime {
             switch (family) {
                 case Family.Station: return Stations;
                 case Family.Creature: return Creatures;
+                case Family.Terrain: return TerrainEdits;
                 default: return Structures;
             }
         }
@@ -348,7 +378,8 @@ namespace NetworkPerformanceSystem.Runtime {
         /// probes; only a matching hash pays for the ZDO lookup and the prefab check. A hit on a
         /// player matches the hash and fails every prefab check, and is left alone. The families
         /// are tried in order - station, creature, structure - so an RPC_Damage on a creature is
-        /// always a creature hit, and one on a wall or a tree is a structure hit.
+        /// always a creature hit, and one on a wall or a tree is a structure hit. Terrain edits share
+        /// no method name with the others, so where they sit in that order does not matter.
         /// </summary>
         private static bool TryClassify(ZDOID target, int methodHash, out ZDO zdo, out Family family) {
             zdo = null;
@@ -359,7 +390,9 @@ namespace NetworkPerformanceSystem.Runtime {
             bool creature = !station && CreatureRequestHashes.Contains(methodHash) && ValConfig.EnableCreatureHitRouting.Value;
             bool structure = !station && StructureRequestHashes.Contains(methodHash)
                 && ValConfig.EnableStructureHitRouting != null && ValConfig.EnableStructureHitRouting.Value;
-            if (!station && !creature && !structure) { return false; }
+            bool terrain = TerrainRequestHashes.Contains(methodHash)
+                && ValConfig.EnableTerrainEditRouting != null && ValConfig.EnableTerrainEditRouting.Value;
+            if (!station && !creature && !structure && !terrain) { return false; }
 
             zdo = ZDOMan.instance?.GetZDO(target);
             if (zdo == null) { return false; }
@@ -367,6 +400,10 @@ namespace NetworkPerformanceSystem.Runtime {
             if (station) {
                 family = Family.Station;
                 return Station(zdo) != null;
+            }
+            if (terrain) {
+                family = Family.Terrain;
+                return IsTerrainCompiler(zdo);
             }
             if (creature && OwnershipPolicy.IsCreature(zdo)) {
                 family = Family.Creature;
@@ -569,9 +606,9 @@ namespace NetworkPerformanceSystem.Runtime {
         /// ownership pass would leave the object with, so a claim made here is one the pass will
         /// not undo two seconds later.
         ///
-        ///   * A station: the peer's 3x3 presence square covers the station's zone - the test the
-        ///     pass uses for "owner present", against the same reference position, so the two can
-        ///     never disagree about who is here.
+        ///   * A station, structure or terrain tile: the peer's 3x3 presence square covers the
+        ///     object's zone - the test the pass uses for "owner present", against the same
+        ///     reference position, so the two can never disagree about who is here.
         ///   * A creature: the creature's zone is in the peer's near ring - what its ZNetScene
         ///     instantiates - which is the test the pass uses to keep a creature with an owner who
         ///     has stepped out of the presence square (OwnershipArbiter.OwnerStillLoads). Exact,
@@ -669,6 +706,23 @@ namespace NetworkPerformanceSystem.Runtime {
             }
             StationPrefabs[prefab] = station;
             return station;
+        }
+
+        /// <summary>
+        /// Is this ZDO a terrain tile's compiler? Answered from the prefab, as Station is, so
+        /// another object that registers an "RPC_ApplyOperation" of its own is left alone.
+        /// </summary>
+        private static bool IsTerrainCompiler(ZDO zdo) {
+            int prefab = zdo.GetPrefab();
+            if (TerrainPrefabs.TryGetValue(prefab, out bool cached)) { return cached; }
+
+            if (ZNetScene.instance == null) { return false; }
+            GameObject go = ZNetScene.instance.GetPrefab(prefab);
+            if (go == null) { return false; }          // unknown here - do not cache a verdict we cannot justify
+
+            bool terrain = go.GetComponent<TerrainComp>() != null;
+            TerrainPrefabs[prefab] = terrain;
+            return terrain;
         }
 
         /// <summary>
@@ -809,9 +863,11 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static void Reset() {
             Held.Clear();
             StationPrefabs.Clear();
+            TerrainPrefabs.Clear();
             Stations.Clear();
             Creatures.Clear();
             Structures.Clear();
+            TerrainEdits.Clear();
         }
     }
 }

@@ -851,17 +851,20 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>
         /// M35 changed one player's creature allowance: "down" (set, or lowered a step), "up",
         /// "clear" (no allowance any more), or "exempt" (lowering it did not make their game any
-        /// faster; cleared and left alone for ten minutes). "allow" is the allowance after the
-        /// change, -1 for none; "owned" the creatures they own now; "ownedAtStart" and
-        /// "fpsAtStart" what they owned and ran at when the first step was taken; "fps" the
-        /// smoothed frame rate the decision was made on. "reason" is "fps" here and "upload" for
-        /// the upload allowance (OnCreatureAllowanceUpload).
+        /// faster; cleared and left alone for ten minutes, or for the rest of the session when
+        /// "session" is set). "allow" is the allowance after the change, -1 for none; "owned"
+        /// the creatures they own now; "ownedAtStart" and "fpsAtStart" what they owned and ran
+        /// at when the first step was taken; "fps" the smoothed frame rate the decision was made
+        /// on; "simMs" their smoothed fixed-update time per second (-1 unknown), which has to be
+        /// 200 or more for a first step; "failures" how many times this session the allowance
+        /// has been given up on them. "reason" is "fps" here and "upload" for the upload
+        /// allowance (OnCreatureAllowanceUpload).
         /// </summary>
         internal static void OnCreatureAllowance(long uid, string action, int steps, int allowance, int owned, int ownedAtStart,
-                                                 float fps, float fpsAtStart) {
+                                                 float fps, float fpsAtStart, float simMs, int failures, bool forSession) {
             if (!ServerRole) { return; }
 
-            EmitServer(Line.Begin("creature_allowance")
+            JsonLine line = Line.Begin("creature_allowance")
                 .Num("t", NowMs, "0.#")
                 .Id("uid", uid)
                 .Str("reason", "fps")
@@ -872,7 +875,10 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("ownedAtStart", ownedAtStart)
                 .Num("fps", fps, "0.#")
                 .Num("fpsAtStart", fpsAtStart, "0.#")
-                .End());
+                .Num("simMs", simMs, "0.#")
+                .Int("failures", failures);
+            if (forSession) { line.Flag("session", true); }
+            EmitServer(line.End());
         }
 
         /// <summary>
@@ -918,6 +924,26 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Id("uid", uid)
                 .Num("usualS", usualSeconds, "0")
                 .Num("deadlineS", deadlineSeconds, "0")
+                .End());
+        }
+
+        /// <summary>
+        /// A listen host's game has just come back from a stall in the background that
+        /// HostKeepalive answered for: "stallS" how long the game was not running, "rounds" how
+        /// many times players without the mod were answered for it, "sends" and "refused" the
+        /// individual answers and those Steam would not take, and "outlasted" set when the stall
+        /// ran past Background Timeout Seconds and the answering stopped. One record per stall.
+        /// </summary>
+        internal static void OnHostKeepalive(float stallSeconds, long rounds, long sends, long refused, bool outlasted) {
+            if (!ServerRole) { return; }
+
+            EmitServer(Line.Begin("host_keepalive")
+                .Num("t", NowMs, "0.#")
+                .Num("stallS", stallSeconds, "0.#")
+                .Int("rounds", (int)rounds)
+                .Int("sends", (int)sends)
+                .Int("refused", (int)refused)
+                .Flag("outlasted", outlasted)
                 .End());
         }
 

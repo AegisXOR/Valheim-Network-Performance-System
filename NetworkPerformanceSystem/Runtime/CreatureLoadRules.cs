@@ -8,9 +8,10 @@ namespace NetworkPerformanceSystem.Runtime {
     /// how much it was simulating. A client sends one to the host every two seconds (M34); a
     /// listen host files its own the same way.
     ///
-    /// Frame rate is what decisions are made on. Simulation time and fixed steps are recorded for
-    /// diagnosis only: the simulation figure is the wall time of MonoUpdaters.FixedUpdate, which
-    /// runs every Character - owned or not - and leaves out PhysX, and fixed steps stay at 50 a
+    /// Frame rate is what decisions are made on. Simulation time only decides whether a slow frame
+    /// rate can be creatures' doing at all (CreatureLoadRules.MinSimMsPerSecond): it is the wall
+    /// time of MonoUpdaters.FixedUpdate, which runs every Character - owned or not - and every
+    /// synced object, and leaves out PhysX. Fixed steps are for diagnosis: they stay at 50 a
     /// second until a game is below about 3 fps.
     /// </summary>
     internal struct FrameReport {
@@ -91,7 +92,8 @@ namespace NetworkPerformanceSystem.Runtime {
         internal float LastUpAt;                // last step up or clear; -inf when never
         internal float RecoverScale;            // 1, doubled when a step down follows a step up too soon (cap 8)
         internal bool Exempt;
-        internal float ExemptUntil;
+        internal float ExemptUntil;             // +inf = for the rest of the session
+        internal int Failures;                  // frame-rate allowance: times given up on this session
 
         internal static AllowanceState Fresh() {
             return new AllowanceState {
@@ -120,6 +122,10 @@ namespace NetworkPerformanceSystem.Runtime {
         /// about how the machine copes now.</summary>
         internal bool Usable;
         internal float Fps;
+
+        /// <summary>Milliseconds per second their game spends in its fixed update, smoothed like
+        /// Fps; -1 when their game cannot time it.</summary>
+        internal float SimMsPerSecond;
 
         /// <summary>Creatures this player owns as of the last ownership pass.</summary>
         internal int Owned;
@@ -245,6 +251,32 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>A step down this long after the last step up starts the recover backoff over.</summary>
         internal const float RecoverScaleResetSeconds = 600f;
+
+        /// <summary>
+        /// The frame-rate allowance only starts on a player whose game spends at least this long
+        /// each second in its fixed update (FrameReport.SimMsPerSecond, smoothed) - a fifth of
+        /// every second. That update is where creature AI runs. Below it, creatures cannot be what
+        /// holds their frame rate down: by the time the allowance is judged (half their creatures
+        /// gone, see ShouldGiveUp) it has taken at most half of that time away, which is short of
+        /// the ImprovementFactor faster it must show, so it would fail its own test. Most slow
+        /// players are well below it: on the Praetoris server 2026-10-07 to 10-11, 86% of the time
+        /// a player was under 25 fps their fixed update took under 200 ms a second (median 115),
+        /// and they ran about 20 fps whether they owned no creatures or sixty. A game that cannot
+        /// time it (-1) is not stepped either: nothing shows creatures are its cost.
+        /// </summary>
+        internal const float MinSimMsPerSecond = 200f;
+
+        /// <summary>
+        /// The frame-rate allowance is given up on a player at most this many times a session; the
+        /// last time, they are left alone for the rest of it rather than for ExemptSeconds. The
+        /// fixed ten minutes let it start over on the same player all day: one player on
+        /// 2026-10-10 was stepped down and given up on 21 times in 6.6 hours, 20-50 creatures
+        /// moved off and back each time, with no change in frame rate. Whether creatures slow a
+        /// game is a property of that machine, not of the moment, so a second failure is the
+        /// answer; the first can still be bad luck - a passing fight, a hitch, a zone loading.
+        /// Doubling the wait instead would still try five or six times in a long evening.
+        /// </summary>
+        internal const int MaxFailuresPerSession = 2;
 
         /// <summary>At most this many creatures are moved off one player per ownership pass.</summary>
         internal const int MaxShedsPerOwnerPerPass = 4;
@@ -399,14 +431,18 @@ namespace NetworkPerformanceSystem.Runtime {
         /// One evaluation of a player's allowance, once per ownership pass.
         ///
         ///   * frame rate under MinFps for HoldSeconds while owning more than MinAllowance, some of
-        ///     it where somebody else could run it (Shared) -> an allowance of three quarters of
-        ///     what they own. A player who is the only option for every creature they run is
-        ///     never given one: there is nobody to give the rest to, and holding them under it
-        ///     would only leave creatures with nobody running them;
+        ///     it where somebody else could run it (Shared), and their game spending at least
+        ///     MinSimMsPerSecond in its fixed update -> an allowance of three quarters of what they
+        ///     own. A player who is the only option for every creature they run is never given
+        ///     one: there is nobody to give the rest to, and holding them under it would only
+        ///     leave creatures with nobody running them. Nor is one whose simulation is too small
+        ///     a share of their frame for creatures to be what slows it;
         ///   * still under, a full HoldSeconds after the allowance was REACHED (owned at or below
         ///     it) -> another step, or, once ShouldGiveUp says so, cleared and exempt for
-        ///     ExemptSeconds. While creatures are still being moved off it waits: there is no
-        ///     verdict yet, and a player nobody can take creatures from never reaches it;
+        ///     ExemptSeconds - for the rest of the session the MaxFailuresPerSession'th time.
+        ///     While creatures are still being moved off it waits: there is no verdict yet, and a
+        ///     player nobody can take creatures from never reaches it. Simulation time is not
+        ///     asked again once it has started: moving creatures off lowers it;
         ///   * at or above MinFps + HealthyMarginFps for RecoverSeconds -> one step back up, the
         ///     last one clearing it. A step down soon after a step up doubles that player's
         ///     recover time (up to 8x), so a machine that only copes with fewer creatures is not
@@ -416,8 +452,31 @@ namespace NetworkPerformanceSystem.Runtime {
             AllowanceRun kind = input.Fps < settings.MinFps ? AllowanceRun.Low
                               : input.Fps >= settings.MinFps + settings.HealthyMarginFps ? AllowanceRun.Healthy
                               : AllowanceRun.None;
-            return Advance(ref state, input.Now, input.Usable, kind, input.Fps, Improved(input.Fps, state.ValueAtStart),
-                           halvedGivesUp: true, input.Owned, input.Shared, settings);
+            AllowanceAction action = Advance(ref state, input.Now, input.Usable, kind, input.Fps, Improved(input.Fps, state.ValueAtStart),
+                                             halvedGivesUp: true, SimulationHeavy(input.SimMsPerSecond), input.Owned, input.Shared, settings);
+            if (action == AllowanceAction.Exempt) {
+                state.Failures++;
+                if (state.Failures >= MaxFailuresPerSession) { state.ExemptUntil = float.PositiveInfinity; }
+            }
+            return action;
+        }
+
+        /// <summary>Whether a game's fixed update takes enough of each second for creatures to be
+        /// what slows it (MinSimMsPerSecond). False when it is not timed.</summary>
+        internal static bool SimulationHeavy(float simMsPerSecond) {
+            return simMsPerSecond >= MinSimMsPerSecond;
+        }
+
+        /// <summary>A fresh frame-rate allowance for a player who has been given up on this many
+        /// times already this session: exempt for good once that is MaxFailuresPerSession.</summary>
+        internal static AllowanceState FreshAfter(int failures) {
+            AllowanceState state = AllowanceState.Fresh();
+            state.Failures = failures;
+            if (failures >= MaxFailuresPerSession) {
+                state.Exempt = true;
+                state.ExemptUntil = float.PositiveInfinity;
+            }
+            return state;
         }
 
         // -- the upload allowance ----------------------------------------------------------
@@ -503,13 +562,15 @@ namespace NetworkPerformanceSystem.Runtime {
                               : input.Room ? AllowanceRun.Healthy
                               : AllowanceRun.None;
             return Advance(ref state, input.Now, input.Usable, kind, input.Delivered, improved: false,
-                           halvedGivesUp: false, input.Owned, input.Shared, settings);
+                           halvedGivesUp: false, mayStart: true, input.Owned, input.Shared, settings);
         }
 
         /// <summary>The rules both allowances share; see Step. kind is this evaluation's verdict:
-        /// Low (struggling), Healthy (room to spare) or None (neither).</summary>
+        /// Low (struggling), Healthy (room to spare) or None (neither). mayStart false holds back
+        /// a first step only.</summary>
         private static AllowanceAction Advance(ref AllowanceState state, float now, bool usable, AllowanceRun kind, float value,
-                                               bool improved, bool halvedGivesUp, int owned, int shared, AllowanceSettings settings) {
+                                               bool improved, bool halvedGivesUp, bool mayStart, int owned, int shared,
+                                               AllowanceSettings settings) {
             if (state.Exempt) {
                 if (now < state.ExemptUntil) { return AllowanceAction.None; }
                 state.Exempt = false;
@@ -544,9 +605,10 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (state.Steps == 0) {
                     if (now - System.Math.Max(state.RunSince, state.LastChangeAt) < settings.HoldSeconds) { return AllowanceAction.None; }
                     if (owned <= settings.MinAllowance) { return AllowanceAction.None; }
-                    // Alone with their creatures. The run keeps going, so the step comes at once
-                    // if somebody who could take some arrives while this player is still slow.
-                    if (shared <= 0) { return AllowanceAction.None; }
+                    // Alone with their creatures, or (frame rate) their simulation is too light for
+                    // creatures to matter. The run keeps going, so the step comes at once if
+                    // somebody who could take some arrives, or it grows, while they are still slow.
+                    if (shared <= 0 || !mayStart) { return AllowanceAction.None; }
 
                     NoteStepDown(ref state, now, settings);
                     state.Steps = 1;

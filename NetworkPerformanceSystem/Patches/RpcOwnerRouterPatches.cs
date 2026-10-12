@@ -6,8 +6,8 @@ namespace NetworkPerformanceSystem.Patches {
 
     /// <summary>
     /// M12 - wiring for RpcOwnerRouter, which delivers owner-addressed requests - station item
-    /// requests, and hits on creatures - to the object's current owner. See the router for the
-    /// rules; this file is only the hooks.
+    /// requests, hits on creatures and structures, and terrain edits - to the object's current
+    /// owner. See the router for the rules; this file is only the hooks.
     ///
     /// Three hooks, all host-side in effect:
     ///   * ZRoutedRpc.RPC_RoutedRPC - every routed RPC a client sends arrives here. The prefix
@@ -41,7 +41,7 @@ namespace NetworkPerformanceSystem.Patches {
             if (incoming == null || route == null || handle == null || update == null || getPeer == null || server == null || id == null) {
                 PatchGuard.Disable(Mechanism.RpcOwnerRouting,
                     "ZRoutedRpc.RPC_RoutedRPC / RouteRPC / HandleRoutedRPC, ZDOMan.Update / GetPeer or ZRoutedRpc's id fields do not have the expected shape. " +
-                    "Either the game updated or another mod rewrote them first. Station requests and creature hits go to whoever the sender names, as vanilla.");
+                    "Either the game updated or another mod rewrote them first. Station requests, hits and terrain edits go to whoever the sender names, as vanilla.");
                 return false;
             }
             return true;

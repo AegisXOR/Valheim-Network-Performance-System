@@ -712,9 +712,10 @@ namespace NetworkPerformanceSystem.Runtime {
         /// Who the player is across reconnects: the platform address of their connection (a
         /// SteamID for the Steam peers this mechanism acts on). A peer id is not enough - it is new
         /// on every connection, and the players this exists for are the ones who drop and rejoin.
-        /// Falls back to the peer id when the socket cannot say.
+        /// Falls back to the peer id when the socket cannot say. PeerCapacity keys its own
+        /// session exemptions the same way.
         /// </summary>
-        private static string PlayerKey(ZNetPeer peer) {
+        internal static string PlayerKey(ZNetPeer peer) {
             string address = null;
             try { address = peer.m_socket?.GetHostName(); } catch (System.Exception) { }
             return string.IsNullOrEmpty(address) ? "peer:" + peer.m_uid : address;

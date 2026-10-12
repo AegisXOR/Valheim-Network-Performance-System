@@ -1,5 +1,12 @@
 # Changelog
 
+**1.17.0**
+- Digging and other changes to the ground now reach whoever owns that ground, instead of sometimes being lost
+- Players with the mod now wait for the host of a game-hosted world whose game stops while backgrounded
+- Other players' map icons now jump straight to where they went after a portal trip instead of sliding there for up to a minute.
+- Map icons of nearby players follow them live, and the server passes on everyone else's moves right away instead of every few seconds.
+- Slow players whose frame rate does not depend on their creatures updates see less creature ownership thrashing
+
 **1.16.0**
 - Drifting ice, floating logs and dropped items in water send far fewer updates, freeing room on everyone's connection in fights by the sea and when sailing through ice.
 - The server now raises how fast it sends to players, and how fast players with the mod may upload, while their connections are full, and backs off on its own when the server's line or a player's connection cannot keep up.

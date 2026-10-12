@@ -112,6 +112,9 @@ namespace NetworkPerformanceSystem {
         // M12 structures - hits, repairs and removals on buildings, trees and rocks delivered to their owner
         public static ConfigEntry<bool> EnableStructureHitRouting;
 
+        // M12 terrain - digging and other ground edits delivered to the owner of each terrain tile
+        public static ConfigEntry<bool> EnableTerrainEditRouting;
+
         // M30 - a status effect asked for on somebody else's creature is not sent on every ask
         public static ConfigEntry<bool> LimitRepeatedStatusEffects;
 
@@ -162,6 +165,12 @@ namespace NetworkPerformanceSystem {
         // M32 - the world's player history goes to a player only when it changed
         public static ConfigEntry<bool> SendPlayerHistoryOnlyWhenChanged;
 
+        // M38 - other players' map icons jump to a far new spot, and follow loaded players live
+        public static ConfigEntry<bool> MapPinsFollowPlayers;
+        // M39 - map positions go out as soon as they are a few metres off, not on the 2-second list
+        public static ConfigEntry<bool> SendMapPositionsRightAway;
+        public static ConfigEntry<int> MapPositionAccuracyMeters;
+
         // M11 - connection timeouts
         public static ConfigEntry<bool> EnableConnectionTimeoutTuning;
         public static ConfigEntry<int> ConnectTimeoutSeconds;
@@ -169,6 +178,7 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<int> LoadingTimeoutSeconds;
         public static ConfigEntry<bool> KeepPlayersInBackground;
         public static ConfigEntry<int> BackgroundTimeoutSeconds;
+        public static ConfigEntry<bool> KeepPlayersWithoutTheMod;
 
         // M21 - ghost peers stop being trusted to simulate long before they are hung up on
         public static ConfigEntry<bool> EvictGhostOwners;
@@ -345,7 +355,7 @@ namespace NetworkPerformanceSystem {
 
             // Creature load
             BalanceCreaturesByFrameRate = BindServerConfig("Creature Load", "Balance Creatures By Frame Rate", true,
-                "Players with this mod tell the server how smoothly their game is running. When a player's frame rate stays under Min Owner FPS while they simulate a lot of creatures in a fight, the server gives them fewer creatures to run and moves the rest, a few at a time, to players whose games have room. Creatures only that player is near stay with them. If moving creatures does not make their game faster, they get them back and are left alone for ten minutes. Players without the mod are treated as before. Needs Arbitrate Creatures.");
+                "Players with this mod tell the server how smoothly their game is running. When a player's frame rate stays under Min Owner FPS while they simulate a lot of creatures in a fight, the server gives them fewer creatures to run and moves the rest, a few at a time, to players whose games have room. A player whose game spends little of each second simulating is not held to fewer, since creatures cannot be what slows it. Creatures only that player is near stay with them. If moving creatures does not make their game faster, they get them back and are left alone for ten minutes, and the second time for the rest of the session. Players without the mod are treated as before. Needs Arbitrate Creatures.");
             BalanceCreaturesByUpload = BindServerConfig("Creature Load", "Balance Creatures By Upload", true,
                 "Every creature a player runs is sent from their machine, so a player running a big fight can fill their upload to the server, and then their creatures stall for everyone else. When a player's upload stays full and a higher upload rate (Auto Player Uploads) cannot fix it soon, the server gives them fewer creatures to run and moves the rest, a few at a time, to players whose uploads have room. Creatures only that player is near stay with them. If their upload is still full at Min Creature Allowance, they get their creatures back and are left alone for ten minutes. Works with Auto Send Rate off too. Players without the mod are treated as before. Needs Arbitrate Creatures.");
             CreatureLoadMinOwnerFps = BindServerConfig("Creature Load", "Min Owner FPS", 25f,
@@ -376,6 +386,8 @@ namespace NetworkPerformanceSystem {
                 "Deliver hits on creatures to whoever is simulating the creature right now, prevents silently dropping hits.");
             EnableStructureHitRouting = BindServerConfig("Routed RPC", "Route Structure Hits To Owner", true,
                 "Deliver hits, repairs, removals and snow changes on buildings, trees and rocks to whoever owns them right now. A player whose copy still names an earlier owner sends them to that player, who drops them without a word. Structure Updates only holds back owner changes while this is on.");
+            EnableTerrainEditRouting = BindServerConfig("Routed RPC", "Route Terrain Edits To Owner", true,
+                "Deliver digging, raising, levelling, cultivating and paving - and GradualTerrain's smoothing around a dig - to whoever owns that piece of ground right now. A player whose copy still names an earlier owner sends the edit to that player, who drops it without a word, and the ground can then split open along the border with the next piece of ground, which did take it.");
             LimitRepeatedStatusEffects = BindServerConfig("Routed RPC", "Limit Repeated Status Effects", true,
                 "Send a status effect to a creature another player is simulating at most 4 times a second, instead of every time something asks for it - and an effect that lasts only once in a third of its duration, at least every 2 seconds, since asking again only restarts its timer. An area that gives a status effect keeps applying it, 50 times a second, to creatures that were yours when they walked in. Once one of them is handed to another player every one of those becomes a message, and a few animals in a base can fill a player's whole upload and stop the world loading for the player they were handed to. Runs on each player's game that has this mod, using the server's setting; the server also stops passing the repeats on from players who do not have it. The log names the effect either way.");
 
@@ -463,8 +475,17 @@ namespace NetworkPerformanceSystem {
             SendPlayerHistoryOnlyWhenChanged = BindServerConfig("Player List", "Send Player History Only When Changed", true,
                 "Server side. Send the list of everyone who has ever joined this world to a player only when it differs from the copy they already have. The game sends the whole list - about 60 bytes for every player the world has seen - to every player whenever it marks it changed, and on some servers it marks it changed on every 2-second update without anything changing: 20 KB to every player every 2 seconds on a world that has seen 340 players, over a third of the server's upload. Players who join still get it, and a real change still goes to everyone. Also covers players who do not have this mod. The log says what keeps marking it changed either way.");
 
+            // Map icons
+            MapPinsFollowPlayers = BindServerConfig("Player List", "Map Pins Follow Players", true,
+                "Each player's own map. Another player's icon jumps straight to where they went after a portal trip, a respawn or a dungeon door, instead of sliding there at 200 m/s - which for a long portal trip takes a minute or more. Players loaded near you are drawn where their character is, and on the host's own map every player is drawn where the host has them, instead of where the last 2-second player list put them. Players who hide their position stay hidden. Works on any server for players who have this mod.");
+            SendMapPositionsRightAway = BindServerConfig("Player List", "Send Map Positions Right Away", true,
+                "Server side. Tell players where everyone is as soon as their map is more than Map Position Accuracy out of date, in a small message of their own (24 bytes a player), instead of waiting for the game's player list every 2 seconds. A portal trip always goes out at once. Players with this mod also tell the server about their own portal trip or respawn straight away instead of within 2 seconds, so the new area starts arriving sooner. Players without the mod keep the game's 2-second list.");
+            MapPositionAccuracyMeters = BindServerConfig("Player List", "Map Position Accuracy", 20,
+                "How far, in metres, another player may move from where everyone's map shows them before the server sends their new position. Lower is more exact and sends a little more for every moving player.",
+                true, Runtime.MapPositions.MinAccuracyMeters, Runtime.MapPositions.MaxAccuracyMeters);
+
             // Timeout Limits
-            EnableConnectionTimeoutTuning = BindServerConfig("Connection Timeout", "Enable Timeout Tuning", true,
+            EnableConnectionTimeoutTuning =BindServerConfig("Connection Timeout", "Enable Timeout Tuning", true,
                 "Let this mod set how long a connection may go quiet before either end hangs up, instead of the game's fixed 30 seconds.");
             ConnectTimeoutSeconds = BindServerConfig("Connection Timeout", "Connect Timeout Seconds", 10,
                 "How long a connection attempt may take before Steam abandons it, in seconds. 10 is Steam's own default, which the game never changes. This covers only the handshake, before the connection exists.",
@@ -476,10 +497,12 @@ namespace NetworkPerformanceSystem {
                 "How long a player who is still joining - connecting, downloading and loading the world, until their character appears - may go without a packet before they are dropped, in seconds. Loading a large modded world can freeze a player's game for a minute or more, so this is kept apart from 'Connection Timeout Seconds'. Never shorter than that setting.",
                 true, 30, 900);
             KeepPlayersInBackground = BindServerConfig("Connection Timeout", "Keep Players In The Background", true,
-                "Do not drop a player for going quiet while their game is in the background - alt-tabbed or minimised. On some computers the game stops running entirely while it is not the active window, and the player then comes back to a lost connection once 'Connection Timeout Seconds' has passed. With this on, a player whose game said it went into the background gets 'Background Timeout Seconds' instead, for as long as it stays there. Turn it off to drop them like anyone else. Players need this mod for the server to know; their creatures are still handed to other players after 'Ghost Owner Evict Seconds'.");
+                "Do not drop a player for going quiet while their game is in the background - alt-tabbed or minimised. On some computers the game stops running entirely while it is not the active window, and the player then comes back to a lost connection once 'Connection Timeout Seconds' has passed. With this on, a player whose game said it went into the background gets 'Background Timeout Seconds' instead, for as long as it stays there. Turn it off to drop them like anyone else. Players need this mod for the server to know; their creatures are still handed to other players after 'Ghost Owner Evict Seconds'. On a server hosted from the game itself it works the other way too: players with this mod wait for the host's game if it stops in the background, instead of all being dropped. A host whose game keeps running there, as it usually does in a window, is only waited for during its first few seconds in the background.");
             BackgroundTimeoutSeconds = BindServerConfig("Connection Timeout", "Background Timeout Seconds", 600,
                 "How long a player whose game is in the background may go without a packet before they are dropped, in seconds, when 'Keep Players In The Background' is on. Never shorter than 'Loading Timeout Seconds'.",
                 false, 30, 3600);
+            KeepPlayersWithoutTheMod = BindServerConfig("Connection Timeout", "Keep Players Without The Mod", true,
+                "On a server hosted from the game itself: while the host's game has stopped in the background and players with this mod are waiting for it, keep players without this mod (or with an older version of it) connected as well, by answering their game's connection check for it. They see the game's own connection warning icon instead of a message. Needs 'Keep Players In The Background'. Turn it off to have them dropped after 30 seconds as before.");
             EvictGhostOwners = BindServerConfig("Connection Timeout", "Evict Ghost Owners", true,
                 "Stop giving objects to a player who has stopped answering. A peer that goes quiet keeps its slot for the full 'Connection Timeout Seconds' so it can come back, but the things it was simulating - creatures especially - are handed to players who are actually there.");
             GhostOwnerEvictSeconds = BindServerConfig("Connection Timeout", "Ghost Owner Evict Seconds", 10f,

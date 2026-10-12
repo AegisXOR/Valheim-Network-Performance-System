@@ -226,6 +226,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendStructureUpdates(sb);
             AppendStatusEffectRepeats(sb);
             AppendPlayerHistoryRepeats(sb);
+            AppendMapPositions(sb);
             AppendRoutedRpc(sb);
             AppendOwnerRpc(sb);
             AppendReferencePositions(sb);
@@ -269,7 +270,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.SteamTransport: return ValConfig.EnableSteamTransportTuning.Value;
                 case Mechanism.SyncListCache: return ValConfig.EnableSyncListCache.Value;
                 case Mechanism.ConnectionTimeout: return ValConfig.EnableConnectionTimeoutTuning.Value;
-                case Mechanism.RpcOwnerRouting: return ValConfig.EnableStationRpcRouting.Value || ValConfig.EnableCreatureHitRouting.Value || ValConfig.EnableStructureHitRouting.Value;
+                case Mechanism.RpcOwnerRouting: return ValConfig.EnableStationRpcRouting.Value || ValConfig.EnableCreatureHitRouting.Value || ValConfig.EnableStructureHitRouting.Value || ValConfig.EnableTerrainEditRouting.Value;
                 case Mechanism.JotunnQueueLimit: return ValConfig.EnableSendWindowSizing.Value;
                 case Mechanism.QueueSizeView: return ValConfig.EnableSendWindowSizing.Value && ValConfig.ReportVanillaQueueSize.Value;
                 case Mechanism.DeserializeAlloc: return AllocationRelief.DeserializeWanted;
@@ -300,6 +301,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 // beyond the relay distance M7 applies.
                 case Mechanism.DamageNumbers: return DamageNumbers.Current != DamageNumbers.Mode.EveryoneNearby;
                 case Mechanism.AutoSendRate: return ValConfig.EnableSteamTransportTuning.Value && ValConfig.AutoSendRate.Value && ValConfig.SteamSendRateKBps.Value <= 0;
+                case Mechanism.MapPins: return ValConfig.MapPinsFollowPlayers.Value;
+                case Mechanism.MapPositions: return ValConfig.SendMapPositionsRightAway.Value;
                 default: return true;
             }
         }
@@ -732,11 +735,13 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (!ValConfig.BalanceCreaturesByFrameRate.Value) {
                     sb.AppendLine("  frame rate       off (Balance Creatures By Frame Rate is off); frame rates are still shown below");
                 } else {
-                    sb.AppendLine($"  rule             under {min:F0} fps for {PeerCapacity.HoldSeconds:F0}s while running more than {minAllowance} creatures, some where somebody else could:");
+                    sb.AppendLine($"  rule             under {min:F0} fps for {PeerCapacity.HoldSeconds:F0}s while running more than {minAllowance} creatures, some where somebody else could,");
+                    sb.AppendLine($"                   and their game's fixed update taking {CreatureLoadRules.MinSimMsPerSecond:F0}+ ms/s (less, and creatures cannot be what slows it):");
                     sb.AppendLine($"                   no new creatures above three quarters of what they run while somebody else can take them, and the rest move,");
                     sb.AppendLine($"                   {CreatureLoadRules.MaxShedsPerOwnerPerPass} a pass, to players at {min + PeerCapacity.HealthyMarginFps:F0}+ fps with upload room (not ones only they are near);");
                     sb.AppendLine($"                   still slow a hold after reaching it: another quarter; at {minAllowance}, or half of where it started, and no faster: dropped,");
-                    sb.AppendLine($"                   left alone {PeerCapacity.ExemptSeconds / 60f:F0} minutes; at {min + PeerCapacity.HealthyMarginFps:F0}+ fps for {PeerCapacity.RecoverSeconds:F0}s: one step back up");
+                    sb.AppendLine($"                   left alone {PeerCapacity.ExemptSeconds / 60f:F0} minutes, or for the rest of the session once dropped {CreatureLoadRules.MaxFailuresPerSession} times; " +
+                                  $"at {min + PeerCapacity.HealthyMarginFps:F0}+ fps for {PeerCapacity.RecoverSeconds:F0}s: one step back up");
                 }
                 if (!ValConfig.BalanceCreaturesByUpload.Value) {
                     sb.AppendLine("  upload           off (Balance Creatures By Upload is off)");
@@ -760,7 +765,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     if (!PeerCapacity.TryGetView(reporting[i], out PeerCapacity.View view)) { continue; }
                     FrameReport last = view.Last;
                     string fps = view.HasFps ? $"{view.Fps:F0}" : "-";
-                    string sim = last.SimMsPerSecond >= 0f ? $"{last.SimMsPerSecond:F0}" : "-";
+                    string sim = view.Sim >= 0f ? $"{view.Sim:F0}" : "-";
                     UploadReading up = view.Upload;
                     string upload = up.Known ? $"{up.Delivered / 1024f:F0}/{up.Rate / 1024}" + (up.Full ? " full" : "") : "-";
                     string allowance = view.Steps > 0 && view.UploadSteps > 0 ? $"{Mathf.Min(view.Allowance, view.UploadAllowance)} (fps {view.Steps}, up {view.UploadSteps})"
@@ -771,9 +776,13 @@ namespace NetworkPerformanceSystem.Runtime {
                     // allowance has nothing to act on, so it is not set, and one already set does
                     // not stop them getting creatures nobody else can take.
                     bool alone = view.Owned > 0 && view.Shared == 0;
-                    string state = view.Exempt ? $"exempt {Elapsed(view.ExemptLeftSeconds)} more - creatures were not the cause"
+                    string state = view.Exempt ? (float.IsPositiveInfinity(view.ExemptLeftSeconds)
+                                                     ? $"exempt this session - creatures were not the cause ({view.Failures} times)"
+                                                     : $"exempt {Elapsed(view.ExemptLeftSeconds)} more - creatures were not the cause")
                                  : view.Steps > 0 ? $"held (was {view.OwnedAtStart} at {view.FpsAtStart:F0} fps)" + (alone ? "; nobody near to take any" : "")
-                                 : view.Low ? (alone ? "slow, but nobody near to take creatures" : "slow (hold running)")
+                                 : view.Low ? (alone ? "slow, but nobody near to take creatures"
+                                             : !view.SimHeavy ? $"slow, but sim under {CreatureLoadRules.MinSimMsPerSecond:F0} ms/s - not creatures"
+                                             : "slow (hold running)")
                                  : null;
                     string upState = view.UploadExempt ? $"upload exempt {Elapsed(view.UploadExemptLeftSeconds)} more - creatures were not what filled it"
                                    : view.UploadSteps > 0 ? $"upload held (was {view.UploadOwnedAtStart} at {view.UploadAtStart / 1024f:F0} KB/s)" + (alone ? "; nobody near to take any" : "")
@@ -791,7 +800,7 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  session totals   {PeerCapacity.ReportsAccepted} reports ({PeerCapacity.ReportsRejected} rejected); {PeerCapacity.TotalStepsDown} steps down, {PeerCapacity.TotalStepsUp} up, " +
                           $"{PeerCapacity.TotalCleared} cleared, {PeerCapacity.TotalExempted} exempted; {OwnershipArbiter.TotalSteered} placed around, {OwnershipArbiter.TotalShed} moved off, {OwnershipArbiter.TotalShedBlocked} blocked");
             sb.AppendLine($"  upload totals    {PeerCapacity.TotalUploadStepsDown} steps down, {PeerCapacity.TotalUploadStepsUp} up, {PeerCapacity.TotalUploadCleared} cleared, {PeerCapacity.TotalUploadExempted} exempted");
-            sb.AppendLine("  fps is smoothed over a few reports. AIs = creatures the player's game says it runs; creatures = the server's count;");
+            sb.AppendLine("  fps and sim (the game's fixed update, ms per second) are smoothed over a few reports. AIs = creatures the player's game says it runs; creatures = the server's count;");
             sb.AppendLine("  upload = what arrives from them / the rate they may send at (the game's, or their Auto Send Rate grant).");
         }
 
@@ -835,6 +844,21 @@ namespace NetworkPerformanceSystem.Runtime {
                     held = $"; {inBackground} player(s) there now, {ConnectionTimeout.BackgroundHolds} kept past the usual deadline this session";
                 }
                 sb.AppendLine($"  in background    {ConnectionTimeout.BackgroundTimeoutSeconds}s while a player's game says it is alt-tabbed or minimised{held}");
+                if (NpsEnv.IsHost() && !NpsEnv.IsDedicated()) {
+                    string now = !ConnectionTimeout.HostInBackground ? ""
+                        : ConnectionTimeout.HostToldWait ? "; in the background now, players are waiting for it"
+                        : "; in the background now and still running, players keep their usual deadline";
+                    sb.AppendLine(ConnectionTimeout.HostStopsInBackground
+                        ? $"  host's game      has stopped in the background this session; players with the mod wait {ConnectionTimeout.BackgroundTimeoutSeconds}s for it whenever it is there{now}"
+                        : $"  host's game      players with the mod wait {ConnectionTimeout.BackgroundTimeoutSeconds}s for it only until it has run {ConnectionTimeout.HostRunningProofSeconds:F0}s in the background{now}");
+                    string keepalive = HostKeepalive.StatsLine();
+                    if (keepalive != null) { sb.AppendLine($"                   {keepalive}"); }
+                } else if (NpsEnv.IsClient() && ConnectionTimeout.HostInBackground) {
+                    ZNetPeer server = ZNet.instance.GetServerPeer();
+                    sb.AppendLine(server != null && ConnectionTimeout.IsInBackground(server.m_rpc)
+                        ? $"  host's game      in the background now - waiting up to {ConnectionTimeout.BackgroundTimeoutSeconds}s for it"
+                        : "  host's game      in the background now and still running - the usual deadline applies");
+                }
             } else if (ConnectionTimeout.Active) {
                 sb.AppendLine("  in background    no longer than anyone else (Keep Players In The Background is off)");
             }
@@ -889,7 +913,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     sb.AppendLine("  watchdog         off (EnableGhostWatchdog)");
                 } else {
                     float deadline = ConnectionTimeout.DeadlineFor(server?.m_rpc);
-                    sb.AppendLine($"  watchdog         warns at {deadline * 0.5f:F0}s, leaves at {deadline:F0}s{(GhostWatchdog.Warning ? "  [WARNING ACTIVE]" : "")}");
+                    sb.AppendLine($"  watchdog         warns at {GhostWatchdog.WarnAfterSeconds(server?.m_rpc):F0}s, leaves at {deadline:F0}s{(GhostWatchdog.Warning ? "  [WARNING ACTIVE]" : "")}");
                     sb.AppendLine($"  session totals   {GhostWatchdog.TotalWarnings} warnings, {GhostWatchdog.TotalTrips} disconnects");
                 }
             }
@@ -1311,6 +1335,38 @@ namespace NetworkPerformanceSystem.Runtime {
                 : "  marked changed   0 times when it was not");
         }
 
+        /// <summary>What M39 has sent or applied, and where M38 took the last frame's map icons
+        /// from. The host sends the updates and a client applies them; a dedicated server draws no
+        /// map, so it has no icon lines.</summary>
+        private static void AppendMapPositions(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Map positions (since start):");
+
+            string reason = PatchGuard.GetDisableReason(Mechanism.MapPositions);
+            if (reason != null) {
+                sb.AppendLine($"  updates stood down: {reason}");
+            } else if (!ValConfig.SendMapPositionsRightAway.Value) {
+                sb.AppendLine("  updates off (players hear where everyone is from the game's 2-second list)");
+            } else if (NpsEnv.IsHost()) {
+                sb.AppendLine($"  sent             {MapPositions.Updates} updates, {MapPositions.BytesSent / 1024f:F1} KB, when a player moved more than {MapPositions.AccuracyMeters:0}m");
+                sb.AppendLine($"  players moved    {MapPositions.PlayersMoved}, {MapPositions.Jumped} of them more than {MapPositions.JumpMeters:0}m (a portal or a respawn)");
+            } else {
+                sb.AppendLine($"  from the host    {MapPositions.UpdatesApplied} updates, {MapPositions.PositionsApplied} positions applied (none from a host without the mod)");
+                sb.AppendLine($"  own jumps        {MapPositions.EarlyReports} reported at once");
+            }
+
+            if (NpsEnv.IsDedicated()) { return; }
+            reason = PatchGuard.GetDisableReason(Mechanism.MapPins);
+            if (reason != null) {
+                sb.AppendLine($"  icons stood down: {reason}");
+            } else if (!ValConfig.MapPinsFollowPlayers.Value) {
+                sb.AppendLine("  icons off (they slide to each new position at 200 m/s, as vanilla)");
+            } else {
+                sb.AppendLine($"  icons            {MapPins.Snapped} jumped to a spot more than {MapPins.SnapMeters:0}m away instead of sliding");
+                sb.AppendLine($"  last frame       {MapPins.LastFromLoaded} drawn live from their character, {MapPins.LastFromHost} from the host's position, {MapPins.LastFromList} from the player list");
+            }
+        }
+
         /// <summary>The send scheduler's effective output. On a small server this simply confirms
         /// the configured rate; on a large one it is the number that says whether the host is
         /// CPU-bound on the send path - the frame budget trades per-peer rate for frame time, and
@@ -1445,6 +1501,18 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine($"  {Pad("re-targeted", 13)} {t.Retargeted} (sender's copy named a stale owner, or nobody - delivered to the current one)");
                 sb.AppendLine($"  {Pad("claimed", 13)} {t.Claimed} (no present owner - handed to the sender first)");
                 AppendHoldLines(sb, t, items: false);
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("Terrain edits (since start):");
+            if (!hooks || !ValConfig.EnableTerrainEditRouting.Value) {
+                sb.AppendLine("  vanilla (digging and other ground edits go to whoever the sender's copy names as each tile's owner)");
+            } else {
+                RpcOwnerRouter.Counters g = RpcOwnerRouter.TerrainEdits;
+                sb.AppendLine($"  {Pad("seen", 13)} {g.Seen} digs, raises, levels, paints and GradualTerrain smoothing on terrain tiles");
+                sb.AppendLine($"  {Pad("re-targeted", 13)} {g.Retargeted} (sender's copy named a stale owner, or nobody - delivered to the current one)");
+                sb.AppendLine($"  {Pad("claimed", 13)} {g.Claimed} (no present owner - handed to the sender first)");
+                AppendHoldLines(sb, g, items: false);
             }
 
             if (RpcOwnerRouter.Waiting > 0) {

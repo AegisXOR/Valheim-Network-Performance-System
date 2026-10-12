@@ -103,7 +103,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
         private static void Deliver(FrameReport report) {
             if (NpsEnv.IsHost()) {
-                PeerCapacity.OnReport(NpsEnv.LocalSessionId(), report, Time.realtimeSinceStartup);
+                PeerCapacity.OnReport(NpsEnv.LocalSessionId(), report, Time.realtimeSinceStartup, null);
                 return;
             }
             if (!LatencyRegistry.HasFreshTable) { return; }

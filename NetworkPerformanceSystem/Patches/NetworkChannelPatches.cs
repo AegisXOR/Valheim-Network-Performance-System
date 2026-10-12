@@ -46,6 +46,13 @@ namespace NetworkPerformanceSystem.Patches {
 
             // M37: the host's grant for this player's upload rate. Only a client acts on one.
             peer.m_rpc.Register<ZPackage>(UploadGrant.RpcUploadRate, UploadGrant.RPC_UploadRate);
+
+            // M11: a listen host saying whether its own game is in the background. Only a client
+            // acts on one.
+            peer.m_rpc.Register<ZPackage>(ConnectionTimeout.RpcHostFocus, ConnectionTimeout.RPC_HostFocus);
+
+            // M39: where players have moved to since the last player list. Only a client acts on one.
+            peer.m_rpc.Register<ZPackage>(MapPositions.RpcMapPositions, MapPositions.RPC_MapPositions);
         }
 
         // -- RTT sampling ------------------------------------------------------------------
@@ -61,7 +68,7 @@ namespace NetworkPerformanceSystem.Patches {
         /// </summary>
         [HarmonyPatch(typeof(ZRpc), "ReceivePing")]
         [HarmonyPostfix]
-        private static void SampleRtt(ZRpc __instance) {
+        private static void SampleRtt(ZRpc __instance, ZPackage package) {
             if (ZNet.instance == null) { return; }
 
             ZNetPeer peer = FindPeerByRpc(__instance);
@@ -70,8 +77,11 @@ namespace NetworkPerformanceSystem.Patches {
             // M21's heartbeat. Deliberately ahead of the RttSampling gate and outside it: this is
             // "a packet arrived from this peer", which is true whether or not we can measure how
             // long it took, and a peer whose RTT we cannot read is exactly the peer whose liveness
-            // we most need to track by other means.
-            PeerLiveness.NoteTraffic(peer.m_uid);
+            // we most need to track by other means. Except a pong from a host we are waiting for
+            // (M11) - see HostKeepalive.CountsAsHostAnswering.
+            if (!NpsEnv.IsClient() || HostKeepalive.CountsAsHostAnswering(ConnectionTimeout.IsInBackground(__instance), package)) {
+                PeerLiveness.NoteTraffic(peer.m_uid);
+            }
 
             if (!PatchGuard.IsActive(Mechanism.RttSampling)) { return; }     // stood down: skip the probe
 
@@ -129,9 +139,13 @@ namespace NetworkPerformanceSystem.Patches {
             if (NpsEnv.IsHost()) {
                 TickLatencyTable(dt);
                 AutoSendRate.Tick(dt);                                        // M37, host-side only
+                ConnectionTimeout.TickHostFocus();                            // M11, listen host only
+                HostKeepalive.Tick(ConnectionTimeout.HostToldWait);           // M11, players without the mod, same wait
+                MapPositions.TickHost();                                      // M39, players who moved since the last list
             } else {
                 GhostWatchdog.Tick();                                         // M22, client-side only
                 UploadGrant.Tick();                                           // M37, a grant the host stopped renewing lapses
+                MapPositions.TickClient(dt);                                  // M39, our own jump reported at once
             }
 
             // Both roles. While monitoring is off this is two config reads and a comparison.
@@ -182,6 +196,7 @@ namespace NetworkPerformanceSystem.Patches {
             CreaturePacing.ForgetPeer(netPeer.m_uid);
             StructureUpdates.ForgetPeer(netPeer.m_uid);
             StatusEffectRepeats.ForgetPeer(netPeer.m_uid);
+            MapPositions.ForgetPeer(netPeer.m_uid);
             // Keyed by connection, not uid: a peer dropped mid-handshake may never have had one.
             ZdoDataGuard.Forget(netPeer.m_rpc);
         }
@@ -205,6 +220,9 @@ namespace NetworkPerformanceSystem.Patches {
             FrameSampler.Reset();
             DamageNumbers.Reset();
             ZdoDataGuard.Reset();
+            HostKeepalive.Stop();
+            MapPins.Reset();
+            MapPositions.Reset();
             _latencyTableTimer = 0f;
         }
     }

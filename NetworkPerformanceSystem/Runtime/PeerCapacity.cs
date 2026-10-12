@@ -24,11 +24,19 @@ namespace NetworkPerformanceSystem.Runtime {
     /// their allowance says. The rules are LossBackoff's, applied to creatures instead of bytes -
     /// CreatureLoadRules.Step:
     ///
+    ///   * only a game that spends a fifth of each second or more in its fixed update, where
+    ///     creature AI runs, is stepped at all (CreatureLoadRules.MinSimMsPerSecond);
     ///   * still struggling a full hold after the allowance was reached -> another step;
     ///   * at the minimum, or at half of what they started with, and no faster than when it
     ///     started -> creatures are not what slows that game: the allowance is cleared and the
-    ///     player is left alone for ten minutes;
+    ///     player is left alone for ten minutes, and the second time for the rest of the server's
+    ///     session - remembered by platform address, like LossBackoff's exemptions;
     ///   * comfortably fast for a minute -> one step back up.
+    ///
+    /// The 2026-10-07 to 10-11 Praetoris recordings are why the first and third rules are what
+    /// they are: 175-314 step-downs a day changed a slow player's frame rate by under one fps,
+    /// slow players owned as many creatures as fast ones, and one player was stepped down and
+    /// given up on 21 times in an evening.
     ///
     /// Players without the mod never report, so nothing here applies to them and the arbiter
     /// treats them exactly as before. Reports are tiny (30 bytes every two seconds) and travel
@@ -79,11 +87,14 @@ namespace NetworkPerformanceSystem.Runtime {
         private const int MaxPackageBytes = CreatureLoadRules.MaxReportBytes + 16;
 
         private sealed class Entry {
+            internal string Key;                     // who they are across reconnects (PlayerFailures)
             internal FrameReport Last;
             internal bool HasReport;
             internal float LastAt;
             internal float FpsEwma;
             internal bool HasFps;
+            internal float SimEwma;                  // fixed-update ms per second, smoothed like fps
+            internal bool HasSim;
             internal int Owned;
             internal int Shared;
             internal AllowanceState State = AllowanceState.Fresh();
@@ -110,8 +121,11 @@ namespace NetworkPerformanceSystem.Runtime {
             internal int OwnedAtStart;
             internal float FpsAtStart;
             internal bool Low;                       // under Min Owner FPS right now
+            internal float Sim;                      // smoothed fixed-update ms per second; -1 unknown
+            internal bool SimHeavy;                  // enough of it for the frame-rate allowance to start
             internal bool Exempt;
-            internal float ExemptLeftSeconds;
+            internal float ExemptLeftSeconds;        // +inf when for the rest of the session
+            internal int Failures;                   // times the frame-rate allowance was given up on
             internal bool Receiver;                  // may take creatures moved off somebody else
 
             internal UploadReading Upload;
@@ -126,6 +140,16 @@ namespace NetworkPerformanceSystem.Runtime {
 
         private static readonly Dictionary<long, Entry> Peers = new Dictionary<long, Entry>();
         private static readonly List<long> Scratch = new List<long>();
+
+        /// <summary>How many times the frame-rate allowance has been given up on each player,
+        /// by platform address (LossBackoff.PlayerKey). Held for the server's session - through
+        /// reconnects, which give a player a new peer id, through a player going quiet long
+        /// enough to be forgotten here, and through the setting being switched off and on - and
+        /// cleared only when the session ends. Memory only; never logged or recorded.</summary>
+        private static readonly Dictionary<string, int> PlayerFailures = new Dictionary<string, int>();
+
+        /// <summary>The key of the listen host's own reports, which come from no peer.</summary>
+        private const string HostKey = "host";
 
         internal static long ReportsAccepted;
         internal static long ReportsRejected;
@@ -178,7 +202,9 @@ namespace NetworkPerformanceSystem.Runtime {
             }
             if (!CreatureLoadRules.TryDecode(bytes, out FrameReport report)) { ReportsRejected++; return; }
 
-            if (!OnReport(peer.m_uid, report, Time.realtimeSinceStartup)) { return; }
+            // Only a player seen for the first time needs their key: it is read once per entry.
+            string key = Peers.ContainsKey(peer.m_uid) ? null : LossBackoff.PlayerKey(peer);
+            if (!OnReport(peer.m_uid, report, Time.realtimeSinceStartup, key)) { return; }
 
             // Whether their game is the active window decides how long they may go quiet before
             // they are dropped (Keep Players In The Background).
@@ -186,12 +212,16 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>A report, from a client or from a listen host's own sampler. False when it
-        /// came too soon after the last one and was dropped.</summary>
-        internal static bool OnReport(long uid, FrameReport report, float now) {
+        /// came too soon after the last one and was dropped. playerKey says who a player seen for
+        /// the first time is across reconnects; null for the listen host's own reports.</summary>
+        internal static bool OnReport(long uid, FrameReport report, float now, string playerKey) {
             if (uid == 0L) { return false; }
 
             if (!Peers.TryGetValue(uid, out Entry e)) {
-                e = new Entry();
+                // Somebody the frame-rate allowance has already been given up on this session,
+                // under this peer id or another, starts where they left off.
+                e = new Entry { Key = playerKey ?? HostKey };
+                e.State = CreatureLoadRules.FreshAfter(FailuresOf(e.Key));
                 Peers[uid] = e;
             } else if (e.HasReport) {
                 // One that says the game has just gone into, or come back from, the background
@@ -217,7 +247,16 @@ namespace NetworkPerformanceSystem.Runtime {
             float fps = report.Fps;
             e.FpsEwma = e.HasFps ? e.FpsEwma + (fps - e.FpsEwma) * FpsAlpha : fps;
             e.HasFps = true;
+            float sim = report.SimMsPerSecond;
+            if (sim >= 0f) {
+                e.SimEwma = e.HasSim ? e.SimEwma + (sim - e.SimEwma) * FpsAlpha : sim;
+                e.HasSim = true;
+            }
             return true;
+        }
+
+        private static int FailuresOf(string key) {
+            return key != null && PlayerFailures.TryGetValue(key, out int failures) ? failures : 0;
         }
 
         // -- the decision ------------------------------------------------------------------
@@ -260,6 +299,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 Now = now,
                 Usable = e.HasFps && now - e.LastAt <= FreshSeconds && !e.Last.Unrepresentative,
                 Fps = e.FpsEwma,
+                SimMsPerSecond = e.HasSim ? e.SimEwma : -1f,
                 Owned = e.Owned,
                 Shared = e.Shared,
             };
@@ -355,9 +395,13 @@ namespace NetworkPerformanceSystem.Runtime {
                     break;
                 case AllowanceAction.Exempt:
                     TotalExempted++;
+                    PlayerFailures[e.Key] = e.State.Failures;
+                    bool forSession = float.IsPositiveInfinity(e.State.ExemptUntil);
                     Logger.LogWarning($"Creature load: {name} is still at {e.FpsEwma:F0} fps after being held to {allowanceBefore} creatures " +
                                       $"({ownedAtStartBefore} and {fpsAtStartBefore:F0} fps when it started), so creatures are not what slows their game. " +
-                                      $"Their allowance is dropped and they are left alone for {ExemptSeconds / 60f:F0} minutes.");
+                                      (forSession
+                                          ? $"Their allowance is dropped, and as this is the {Ordinal(e.State.Failures)} time, they are left alone for the rest of the session."
+                                          : $"Their allowance is dropped and they are left alone for {ExemptSeconds / 60f:F0} minutes."));
                     break;
             }
 
@@ -366,7 +410,18 @@ namespace NetworkPerformanceSystem.Runtime {
                                                allowance == int.MaxValue ? -1 : allowance, e.Owned,
                                                action == AllowanceAction.Exempt ? ownedAtStartBefore : e.State.OwnedAtStart,
                                                e.FpsEwma,
-                                               action == AllowanceAction.Exempt ? fpsAtStartBefore : e.State.ValueAtStart);
+                                               action == AllowanceAction.Exempt ? fpsAtStartBefore : e.State.ValueAtStart,
+                                               e.HasSim ? e.SimEwma : -1f, e.State.Failures,
+                                               action == AllowanceAction.Exempt && float.IsPositiveInfinity(e.State.ExemptUntil));
+            }
+        }
+
+        private static string Ordinal(int n) {
+            switch (n) {
+                case 1: return "first";
+                case 2: return "second";
+                case 3: return "third";
+                default: return n + "th";
             }
         }
 
@@ -438,7 +493,7 @@ namespace NetworkPerformanceSystem.Runtime {
             foreach (Entry e in Peers.Values) {
                 if (!byFps) {
                     if (e.State.Steps > 0) { dropped++; }
-                    e.State = AllowanceState.Fresh();
+                    e.State = CreatureLoadRules.FreshAfter(FailuresOf(e.Key));
                 }
                 if (!byUpload) {
                     if (e.Upload.Steps > 0) { dropped++; }
@@ -497,12 +552,13 @@ namespace NetworkPerformanceSystem.Runtime {
         /// their own, and an upload with room that has not lost packets for UploadCleanSeconds
         /// (CreatureLoadRules; always, while the upload rule is off). A player who has never
         /// reported - no mod, or a dedicated server - never is: there is no telling whether their
-        /// game has room.</summary>
+        /// game has room. While a player is exempt their run is not followed, so only their frame
+        /// rate now decides - an exemption can last the whole session.</summary>
         internal static bool IsShedReceiver(long uid, float now) {
             if (!Peers.TryGetValue(uid, out Entry e)) { return false; }
             if (!e.HasFps || e.Last.Unrepresentative) { return false; }
             if (now - e.LastAt > FreshSeconds) { return false; }
-            if (e.State.Steps > 0 || e.State.Run == AllowanceRun.Low) { return false; }
+            if (e.State.Steps > 0 || (e.State.Run == AllowanceRun.Low && !e.State.Exempt)) { return false; }
             if (e.Upload.Steps > 0 || e.UploadStuck || !CreatureLoadRules.UploadHasRoom(e.UploadNow)) { return false; }
             if (now - e.UploadLossyAt < CreatureLoadRules.UploadCleanSeconds) { return false; }
             return e.FpsEwma >= ValConfig.CreatureLoadMinOwnerFps.Value + HealthyMarginFps;
@@ -527,8 +583,11 @@ namespace NetworkPerformanceSystem.Runtime {
                 OwnedAtStart = e.State.OwnedAtStart,
                 FpsAtStart = e.State.ValueAtStart,
                 Low = e.HasFps && e.FpsEwma < ValConfig.CreatureLoadMinOwnerFps.Value,
+                Sim = e.HasSim ? e.SimEwma : -1f,
+                SimHeavy = e.HasSim && CreatureLoadRules.SimulationHeavy(e.SimEwma),
                 Exempt = e.State.Exempt && now < e.State.ExemptUntil,
                 ExemptLeftSeconds = e.State.Exempt ? e.State.ExemptUntil - now : 0f,
+                Failures = e.State.Failures,
                 Receiver = Balancing && IsShedReceiver(uid, now),
                 Upload = e.UploadNow,
                 UploadStuck = e.UploadStuck,
@@ -570,9 +629,11 @@ namespace NetworkPerformanceSystem.Runtime {
             Peers.Remove(uid);
         }
 
+        /// <summary>Session end, which is also where the session's exemptions end.</summary>
         internal static void Reset() {
             Peers.Clear();
             Scratch.Clear();
+            PlayerFailures.Clear();
         }
     }
 }

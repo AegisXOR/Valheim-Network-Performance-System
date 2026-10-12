@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using Steamworks;
+using UnityEngine;
 
 namespace NetworkPerformanceSystem.Runtime {
 
@@ -63,6 +65,30 @@ namespace NetworkPerformanceSystem.Runtime {
     /// that Steam would otherwise drop sooner. Their objects are not held: PeerLiveness stops
     /// trusting a quiet peer to simulate anything long before either deadline.</para>
     ///
+    /// <para>AND THE SAME FOR THE HOST. On a server hosted from the game itself the host is a
+    /// player who alt-tabs too. Usually nothing happens: most hosts play windowed, the game keeps
+    /// running in the background, and its main thread goes on answering every client's ZRpc
+    /// ping. But where the host's game does stop it is the clients that hang up - only the
+    /// host's main thread answers those pings, so at the client's in-world deadline every player
+    /// is dropped at once. (The host's own end drops nobody: when it runs again it reads the
+    /// replies that queued up before it counts the silence.) So a listen host tells every player
+    /// with this mod when its game goes into the background, and their games give the host's
+    /// connection the background deadline the same way.</para>
+    ///
+    /// <para>Only for as long as the host's game might have stopped, though. A game that stops
+    /// in the background stops at once, so one still running a few seconds after losing focus
+    /// is a game that keeps running, and the host then says so: its players go back to their
+    /// usual deadline, and a host whose game crashes or whose line drops while it sits behind
+    /// another window is noticed as quickly as one in front - not after the background deadline,
+    /// in a frozen world, under a message blaming the background. A game that does stall in the
+    /// background later on (minimised after the alt-tab, say) has shown it can stop, and from
+    /// then on its players wait for it whenever it is in the background, for the rest of the
+    /// session. The message goes out the moment anything changes and every two seconds while
+    /// the game stays in the background, so a player who joins meanwhile hears it too. When the
+    /// host's players are waiting, GhostWatchdog says on screen why, so they can leave sooner.
+    /// Vanilla clients and older versions of this mod never hear it; HostKeepalive answers their
+    /// pings for the host instead, for as long as players with the mod are waiting.</para>
+    ///
     /// Everything is written after vanilla has written its own - a postfix on each seam - and read
     /// back, so a refused write is visible in the log rather than assumed to have worked.
     /// </summary>
@@ -120,8 +146,8 @@ namespace NetworkPerformanceSystem.Runtime {
             /// clears the character id for a moment and is not a new join.</summary>
             internal bool InWorld;
 
-            /// <summary>Host only: the last frame report from this player's game said it is not
-            /// the active window.</summary>
+            /// <summary>The game at the other end last said it is not the active window: on a
+            /// host, this player's frame report; on a client, the host's own word.</summary>
             internal bool InBackground;
 
             /// <summary>The background deadline has been logged as holding this player since they
@@ -141,6 +167,49 @@ namespace NetworkPerformanceSystem.Runtime {
         /// SetLongTimeout once per accepted socket, and re-logging an unchanged value per join
         /// would be noise.</summary>
         private static string _lastLoggedRpc;
+
+        /// <summary>A listen host telling its players whether its own game is in the background,
+        /// and whether to wait for it. One byte of flags, so a later version can add to it.</summary>
+        internal const string RpcHostFocus = "Nps.HostFocus";
+
+        /// <summary>Wait for the host: its game is in the background and has not been seen to keep
+        /// running there. The only flag that changes a deadline.</summary>
+        private const byte HostFocusWait = 1;
+
+        /// <summary>The host's game is in the background at all - for display.</summary>
+        private const byte HostFocusInBackground = 2;
+
+        /// <summary>While the host's game stays in the background it says so again this often,
+        /// so a player who joined in the meantime hears it too. A few bytes per player.</summary>
+        private const float HostFocusRepeatSeconds = 2f;
+
+        /// <summary>A game still running this long after losing focus is one that keeps running
+        /// in the background. One that stops does so straight away - the minimise that comes
+        /// with an alt-tab out of fullscreen takes a fraction of a second.</summary>
+        internal const float HostRunningProofSeconds = 5f;
+
+        /// <summary>A frame at least this long in the background means this game can stop there:
+        /// half the in-world deadline, the point at which a stall starts to threaten anyone's
+        /// connection, and never under this floor so ordinary hitches do not count.</summary>
+        private const float MinHostStallSeconds = 5f;
+
+        /// <summary>The listen host's game is in the background. On the host: what its players
+        /// were last told. On a client: what the host last said. Only while Keep Players In The
+        /// Background is on - with it off the host tells its players it is in front.</summary>
+        internal static bool HostInBackground { get; private set; }
+
+        /// <summary>Listen host: its players were last told to wait for it.</summary>
+        internal static bool HostToldWait { get; private set; }
+
+        /// <summary>Listen host: its game has stalled in the background this session, so its
+        /// players wait for it whenever it is there, however long it has been running.</summary>
+        internal static bool HostStopsInBackground { get; private set; }
+
+        private static byte _hostToldFlags;
+        private static float _hostFocusRepeatAt;
+        private static bool _hostWasBackground;
+        private static float _hostBackgroundSince;
+        private static float _hostLastTickAt = -1f;
 
         /// <summary>
         /// True when the admin has left the mechanism switched on and its patches survived.
@@ -174,6 +243,13 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static float DeadlineFor(ZRpc rpc) {
             if (rpc == null || !_peers.TryGetValue(rpc, out PeerState state)) { return JoiningTimeoutSeconds; }
             return DeadlineOf(state);
+        }
+
+        /// <summary>This connection's deadline without the background one - what it would be if
+        /// the game at the other end were the active window.</summary>
+        internal static float UsualDeadlineFor(ZRpc rpc) {
+            if (rpc == null || !_peers.TryGetValue(rpc, out PeerState state)) { return JoiningTimeoutSeconds; }
+            return BaseDeadlineOf(state);
         }
 
         private static float BaseDeadlineOf(PeerState state) {
@@ -223,6 +299,12 @@ namespace NetworkPerformanceSystem.Runtime {
             state.Held = true;
             BackgroundHolds++;
 
+            if (!NpsEnv.IsHost()) {
+                Logger.LogInfo($"The host's game is in the background and has not answered for {usual:F0}s. " +
+                               $"Waiting for it for up to {deadline:F0}s while it stays there (Keep Players In The Background).");
+                return;
+            }
+
             ZNetPeer peer = ZNet.instance != null ? Patches.NetworkChannelPatches.FindPeerByRpc(rpc) : null;
             string name = peer != null && !string.IsNullOrEmpty(peer.m_playerName) ? peer.m_playerName : "A player";
             Logger.LogInfo($"{name}'s game is in the background and has not answered for {usual:F0}s. " +
@@ -243,8 +325,9 @@ namespace NetworkPerformanceSystem.Runtime {
             _peers.GetOrCreateValue(rpc).InWorld = true;
         }
 
-        /// <summary>Host: a frame report from this connection's player said whether their game is
-        /// the active window (PeerCapacity.RPC_ClientLoad).</summary>
+        /// <summary>The game at the other end of this connection said whether it is the active
+        /// window. Host: a player's frame report (PeerCapacity.RPC_ClientLoad). Client: the
+        /// host's own word about its game (RPC_HostFocus).</summary>
         internal static void NoteFocus(ZRpc rpc, bool inBackground) {
             if (rpc == null) { return; }
             PeerState state;
@@ -255,6 +338,107 @@ namespace NetworkPerformanceSystem.Runtime {
             }
             state.InBackground = inBackground;
             if (!inBackground) { state.Held = false; }
+        }
+
+        /// <summary>
+        /// Listen host, once per frame from the ZNet.Update postfix: tell every player whether
+        /// this game is in the background and whether to wait for it. The send hands the message
+        /// to Steam, whose own thread delivers it even if this one stops straight after - which,
+        /// on a machine that stops the game in the background, it does. A dedicated server has
+        /// no window.
+        /// </summary>
+        internal static void TickHostFocus() {
+            if (NpsEnv.IsDedicated()) { return; }
+
+            // The loading screen's frames are long whatever the window is doing.
+            Player player = Player.m_localPlayer;
+            bool loading = player == null || player.IsTeleporting();
+            bool background = KeepInBackground && !Application.isFocused;
+            if (StepHostFocus(background, loading, Time.realtimeSinceStartup, out byte flags)) {
+                SendHostFocus(flags);
+            }
+        }
+
+        /// <summary>A stall in the background at least this long means this game can stop there.</summary>
+        private static float HostStallSeconds => Math.Max(MinHostStallSeconds, InWorldTimeoutSeconds * 0.5f);
+
+        /// <summary>
+        /// The host's decision for this frame, with nothing of Unity in it: the flags its players
+        /// should have, and true when they need telling now - the moment the flags change, and
+        /// every couple of seconds while the game is in the background.
+        ///
+        /// Players wait for the host from the moment its game loses focus until it has been seen
+        /// running in the background for HostRunningProofSeconds; after that its game evidently
+        /// keeps running there, and they go back to their usual deadline. A frame of
+        /// HostStallSeconds or more in the background, outside a loading screen, means it does
+        /// stop there after all, and they wait whenever it is in the background from then on.
+        /// </summary>
+        internal static bool StepHostFocus(bool background, bool loading, float now, out byte flags) {
+            float gap = _hostLastTickAt >= 0f ? now - _hostLastTickAt : 0f;
+            _hostLastTickAt = now;
+
+            if (background && !_hostWasBackground) {
+                _hostBackgroundSince = now;
+            } else if (background && !loading && !HostStopsInBackground && gap >= HostStallSeconds) {
+                HostStopsInBackground = true;
+                Logger.LogInfo($"This game stopped for {gap:F0}s while it was in the background. For the rest of the session, " +
+                               "players with this mod will wait for it whenever it is in the background (Keep Players In The Background).");
+            }
+            _hostWasBackground = background;
+
+            flags = 0;
+            if (background) {
+                flags = HostFocusInBackground;
+                if (HostStopsInBackground || now - _hostBackgroundSince < HostRunningProofSeconds) { flags |= HostFocusWait; }
+            }
+            HostInBackground = background;
+            HostToldWait = (flags & HostFocusWait) != 0;
+
+            if (flags != _hostToldFlags) {
+                _hostToldFlags = flags;
+                _hostFocusRepeatAt = now;
+                return true;
+            }
+            if (flags == 0 || now - _hostFocusRepeatAt < HostFocusRepeatSeconds) { return false; }
+            _hostFocusRepeatAt = now;
+            return true;
+        }
+
+        private static void SendHostFocus(byte flags) {
+            List<ZNetPeer> peers = ZNet.instance.GetPeers();
+            for (int i = 0; i < peers.Count; i++) {
+                ZNetPeer peer = peers[i];
+                if (peer == null || !peer.IsReady() || peer.m_rpc == null) { continue; }
+                ZPackage pkg = new ZPackage();
+                pkg.Write(flags);
+                peer.m_rpc.Invoke(RpcHostFocus, pkg);
+            }
+        }
+
+        /// <summary>Client: the host says whether its own game is in the background, and whether
+        /// to wait for it. A host ignores it - only a listen host sends one, and only to its
+        /// players.</summary>
+        internal static void RPC_HostFocus(ZRpc rpc, ZPackage pkg) {
+            if (NpsEnv.IsHost() || rpc == null) { return; }
+            if (!TryReadHostFocus(pkg, out bool wait, out bool inBackground)) { return; }
+            HostInBackground = inBackground;
+            NoteFocus(rpc, wait);
+        }
+
+        /// <summary>The host's message, read. False for an empty or unreadable one, which
+        /// changes nothing.</summary>
+        internal static bool TryReadHostFocus(ZPackage pkg, out bool wait, out bool inBackground) {
+            wait = false;
+            inBackground = false;
+            if (pkg == null) { return false; }
+            try {
+                byte flags = pkg.ReadByte();
+                wait = (flags & HostFocusWait) != 0;
+                inBackground = wait || (flags & HostFocusInBackground) != 0;
+                return true;
+            } catch (Exception) {
+                return false;
+            }
         }
 
         /// <summary>Called from the ZRpc.SetLongTimeout postfix - the one place vanilla writes
@@ -287,6 +471,14 @@ namespace NetworkPerformanceSystem.Runtime {
             _lastLoggedRpc = null;
             _peers = new ConditionalWeakTable<ZRpc, PeerState>();
             BackgroundHolds = 0;
+            HostInBackground = false;
+            HostToldWait = false;
+            HostStopsInBackground = false;
+            _hostToldFlags = 0;
+            _hostFocusRepeatAt = 0f;
+            _hostWasBackground = false;
+            _hostBackgroundSince = 0f;
+            _hostLastTickAt = -1f;
         }
 
         /// <summary>
